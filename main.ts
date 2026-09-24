@@ -2,6 +2,8 @@ const RELAY_SECRET = (Deno.env.get("RELAY_SECRET") ?? "").trim();
 const DISCORD_API = "https://discord.com";
 const DISCORD_GATEWAY = "wss://gateway.discord.gg/";
 
+const activeSockets = new Set<WebSocket>();
+
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data, null, 2) + "\n", {
     status,
@@ -12,9 +14,18 @@ function json(data: unknown, status = 200): Response {
   });
 }
 
+function safeClose(socket: WebSocket, code = 1000, reason = "") {
+  try {
+    if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+      socket.close(code, reason.slice(0, 123));
+    }
+  } catch {
+    // Ignore duplicate/late closes.
+  }
+}
+
 function cleanHeaders(input: Headers): Headers {
   const headers = new Headers(input);
-  // Hop-by-hop / hosting-specific headers should not be forwarded upstream.
   for (const name of [
     "host",
     "connection",
@@ -35,10 +46,6 @@ function cleanHeaders(input: Headers): Headers {
 async function proxyDiscordRest(request: Request, url: URL, path: string): Promise<Response> {
   const upstream = new URL(path + url.search, DISCORD_API);
   const upstreamHeaders = cleanHeaders(request.headers);
-
-  // Deno fetch may transparently decompress upstream bodies while preserving
-  // Content-Encoding. Force identity encoding to avoid double-decompression
-  // in downstream clients such as aiohttp/discord.py.
   upstreamHeaders.set("accept-encoding", "identity");
 
   const init: RequestInit = {
@@ -53,10 +60,6 @@ async function proxyDiscordRest(request: Request, url: URL, path: string): Promi
 
   try {
     const response = await fetch(upstream, init);
-
-    // Materialize the body and rebuild the response without compression
-    // metadata. This prevents downstream aiohttp from trying to gunzip
-    // a body Deno has already decompressed.
     const body = await response.arrayBuffer();
     const headers = new Headers(response.headers);
     for (const name of [
@@ -91,23 +94,17 @@ function proxyDiscordGateway(request: Request, url: URL): Response {
   const upstreamUrl = new URL(DISCORD_GATEWAY);
   upstreamUrl.search = url.search;
   const upstream = new WebSocket(upstreamUrl.toString());
+
   upstream.binaryType = "arraybuffer";
   client.binaryType = "arraybuffer";
+
+  activeSockets.add(client);
+  activeSockets.add(upstream);
 
   let clientOpen = false;
   let upstreamOpen = false;
   const pendingToUpstream: (string | ArrayBuffer | Blob)[] = [];
   const pendingToClient: (string | ArrayBuffer | Blob)[] = [];
-
-  const safeClose = (socket: WebSocket, code = 1000, reason = "") => {
-    try {
-      if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
-        socket.close(code, reason.slice(0, 123));
-      }
-    } catch {
-      // Ignore duplicate/late closes.
-    }
-  };
 
   client.onopen = () => {
     clientOpen = true;
@@ -146,10 +143,12 @@ function proxyDiscordGateway(request: Request, url: URL): Response {
   };
 
   client.onclose = (event) => {
+    activeSockets.delete(client);
     safeClose(upstream, event.code || 1000, event.reason || "client closed");
   };
 
   upstream.onclose = (event) => {
+    activeSockets.delete(upstream);
     safeClose(client, event.code || 1000, event.reason || "discord closed");
   };
 
@@ -159,17 +158,16 @@ function proxyDiscordGateway(request: Request, url: URL): Response {
 async function handler(request: Request): Promise<Response> {
   const url = new URL(request.url);
 
-  // Public health endpoint. It intentionally reveals no secret value.
   if (url.pathname === "/") {
     return json({
       ok: true,
       service: "discord-deno-relay",
       secret_configured: RELAY_SECRET.length > 0,
       runtime: "deno",
+      active_websockets: activeSockets.size,
     });
   }
 
-  // Public server-side connectivity test; no bot token is involved.
   if (url.pathname === "/test-discord") {
     const started = performance.now();
     try {
@@ -185,12 +183,14 @@ async function handler(request: Request): Promise<Response> {
         status: response.status,
         elapsed_ms: Math.round(performance.now() - started),
         body: body.slice(0, 500),
+        active_websockets: activeSockets.size,
       }, response.ok ? 200 : 502);
     } catch (error) {
       return json({
         ok: false,
         elapsed_ms: Math.round(performance.now() - started),
         error: String(error),
+        active_websockets: activeSockets.size,
       }, 502);
     }
   }
@@ -216,5 +216,16 @@ async function handler(request: Request): Promise<Response> {
 
   return json({ ok: false, error: "Not found" }, 404);
 }
+
+// Deno Deploy can evict a healthy instance even while a WebSocket is open.
+// Close sockets explicitly on SIGINT so clients reconnect to a fresh instance
+// instead of lingering on a dead relay session.
+Deno.addSignalListener("SIGINT", () => {
+  console.log(`SIGINT received; closing ${activeSockets.size} WebSocket(s) for reconnect`);
+  for (const socket of Array.from(activeSockets)) {
+    safeClose(socket, 1012, "relay instance restarting");
+  }
+  activeSockets.clear();
+});
 
 Deno.serve(handler);
