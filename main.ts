@@ -34,9 +34,16 @@ function cleanHeaders(input: Headers): Headers {
 
 async function proxyDiscordRest(request: Request, url: URL, path: string): Promise<Response> {
   const upstream = new URL(path + url.search, DISCORD_API);
+  const upstreamHeaders = cleanHeaders(request.headers);
+
+  // Deno fetch may transparently decompress upstream bodies while preserving
+  // Content-Encoding. Force identity encoding to avoid double-decompression
+  // in downstream clients such as aiohttp/discord.py.
+  upstreamHeaders.set("accept-encoding", "identity");
+
   const init: RequestInit = {
     method: request.method,
-    headers: cleanHeaders(request.headers),
+    headers: upstreamHeaders,
     redirect: "manual",
   };
 
@@ -46,12 +53,22 @@ async function proxyDiscordRest(request: Request, url: URL, path: string): Promi
 
   try {
     const response = await fetch(upstream, init);
-    // Rebuild the response so hop-by-hop headers from the upstream are not leaked.
+
+    // Materialize the body and rebuild the response without compression
+    // metadata. This prevents downstream aiohttp from trying to gunzip
+    // a body Deno has already decompressed.
+    const body = await response.arrayBuffer();
     const headers = new Headers(response.headers);
-    headers.delete("content-length");
-    headers.delete("transfer-encoding");
-    headers.delete("connection");
-    return new Response(response.body, {
+    for (const name of [
+      "content-encoding",
+      "content-length",
+      "transfer-encoding",
+      "connection",
+    ]) {
+      headers.delete(name);
+    }
+
+    return new Response(body, {
       status: response.status,
       statusText: response.statusText,
       headers,
@@ -157,7 +174,10 @@ async function handler(request: Request): Promise<Response> {
     const started = performance.now();
     try {
       const response = await fetch("https://discord.com/api/v10/gateway", {
-        headers: { "user-agent": "RocketWatchRelay/1.0" },
+        headers: {
+          "user-agent": "RocketWatchRelay/1.0",
+          "accept-encoding": "identity",
+        },
       });
       const body = await response.text();
       return json({
